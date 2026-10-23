@@ -70,6 +70,9 @@ fi
 
 # ---------- 4. 启动 ----------
 mkdir -p profile
+# 容器里的 neko 用户是 uid 1000；profile 若归 root 所有，Chromium 写不了资料目录会崩溃循环
+# （本地实测：root 所有时 crashpad 反复 SIGTRAP，改归 1000 后正常）
+$SUDO chown -R 1000:1000 profile
 say "拉取镜像并启动…"
 docker compose pull
 docker compose up -d
