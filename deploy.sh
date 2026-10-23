@@ -54,6 +54,12 @@ fi
 ./chrome-linux64/chrome --version >/dev/null 2>&1 || die "Chrome 无法运行（缺系统库时执行：apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 libcairo2）"
 say "Chrome: $(./chrome-linux64/chrome --version)"
 
+# ---------- 2.5 音频组件（声音功能用：虚拟声卡 + 编码器） ----------
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v pulseaudio >/dev/null 2>&1; then
+  say "安装音频组件 ffmpeg + pulseaudio…"
+  apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg pulseaudio || say "音频组件安装失败：浏览器照常可用，只是没有声音"
+fi
+
 # ---------- 3. 编译 ----------
 say "编译 browser-boxd…"
 go build -trimpath -o browser-boxd .

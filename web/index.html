@@ -82,10 +82,10 @@ padding: 7px 4px; border-bottom: 1px solid #1d2536; font-size: 14px;}
 <button id="reload" title="刷新">⟳</button>
 <button id="home" title="起始页">⌂</button>
 <input id="url" placeholder="输入网址，回车打开" inputmode="url">
-<select id="quality" title="画质">
-<option value="40">流畅</option>
-<option value="60" selected>清晰</option>
-<option value="80">高清</option>
+<select id="quality" title="流畅度 / 画质">
+<option value="smooth">流畅优先</option>
+<option value="clear" selected>清晰</option>
+<option value="hd">高清</option>
 </select>
 <select id="zoom" title="缩放">
 <option value="1" selected>100%</option>
@@ -94,6 +94,7 @@ padding: 7px 4px; border-bottom: 1px solid #1d2536; font-size: 14px;}
 <option value="2">200%</option>
 </select>
 <span id="fps"></span>
+<button id="audioBtn" title="声音开关（远程浏览器的声音）">🔇</button>
 <button id="kbdBtn" title="唤起键盘（含中文输入法）">⌨</button>
 <button id="pasteBtn" title="粘贴文字到远程浏览器">粘贴</button>
 <button id="clipBtn" title="把远程浏览器里复制的文字取回本地">取剪贴板</button>
@@ -162,19 +163,35 @@ ws.onopen = () => { setOverlay(''); sendResize();};
 ws.onclose = () => { setOverlay('连接断开，重连中…'); setTimeout(connect, 2500);};
 ws.onerror = () => { try { ws.close();} catch {}};
 ws.onmessage = async ev => {
-if (typeof ev.data === 'string' || (ev.data instanceof Blob && ev.data.size > 0 && (await peek(ev.data)) === '{')) {
-try { handleControl(JSON.parse(typeof ev.data === 'string'? ev.data: await ev.data.text()));} catch {}
+if (typeof ev.data === 'string') {
+try { handleControl(JSON.parse(ev.data)); } catch {}
 return;
 }
+const first = await peek(ev.data);
+if (first === '{') {
+try { handleControl(JSON.parse(await ev.data.text())); } catch {}
+return;
+}
+if (first.charCodeAt(0) === 0xA1) { onAudioChunk(ev.data.slice(1)); return; }
 framesThisSecond++;
-const bmp = await createImageBitmap(ev.data);
-if (bmp.width!== frameW || bmp.height!== frameH) {
+if (decoding) { pendingFrame = ev.data; return; }
+decoding = true;
+let blob = ev.data;
+while (blob) {
+try {
+const bmp = await createImageBitmap(blob);
+if (bmp.width !== frameW || bmp.height !== frameH) {
 frameW = bmp.width; frameH = bmp.height; canvas.width = frameW; canvas.height = frameH;
 }
 ctx.drawImage(bmp, 0, 0); bmp.close();
+} catch {}
+blob = pendingFrame; pendingFrame = null;
+}
+decoding = false;
 };
 }
-async function peek(blob) { const b = await blob.slice(0, 1).text(); return b;}
+let decoding = false, pendingFrame = null;
+async function peek(blob) { return await blob.slice(0, 1).text(); }
 
 setInterval(() => { $('#fps').textContent = framesThisSecond? framesThisSecond + ' fps': ''; framesThisSecond = 0;}, 1000);
 
@@ -256,7 +273,12 @@ $('#back').onclick = () => send({ type: 'back'});
 $('#fwd').onclick = () => send({ type: 'forward'});
 $('#reload').onclick = () => send({ type: 'reload'});
 $('#home').onclick = () => send({ type: 'home'});
-$('#quality').onchange = e => send({ type: 'quality', quality: parseInt(e.target.value, 10)});
+const PERF = {
+smooth: { quality: 40, fps: 15, scale: 0.7 },
+clear: { quality: 60, fps: 24, scale: 1 },
+hd: { quality: 80, fps: 30, scale: 1 },
+};
+$('#quality').onchange = e => send({ type: 'perf', ...PERF[e.target.value] });
 $('#zoom').onchange = e => send({ type: 'zoom', dsf: parseFloat(e.target.value)});
 $('#clipBtn').onclick = () => { send({ type: 'clipread'}); toast('正在读取远程剪贴板…');};
 
@@ -266,6 +288,48 @@ $('#pasteSend').onclick = () => {
 const t = $('#pasteText').value;
 if (t) send({ type: 'text', text: t});
 $('#pasteText').value = ''; $('#pasteBox').style.display = 'none'; canvas.focus();
+};
+
+/* ---------- audio (fMP4/AAC over the same socket, 0xA1-prefixed) ---------- */
+let audioOn = false, msA = null, sbA = null, aEl = null, aQueue = [];
+function pumpA() {
+  if (sbA && !sbA.updating && aQueue.length) {
+    try { sbA.appendBuffer(aQueue.shift()); } catch { aQueue = []; }
+  }
+}
+function onAudioChunk(blob) {
+  if (!audioOn) return;
+  blob.arrayBuffer().then(buf => {
+    aQueue.push(buf);
+    if (aQueue.length > 40) aQueue.splice(0, aQueue.length - 40);
+    pumpA();
+  });
+}
+$('#audioBtn').onclick = () => {
+  const btn = $('#audioBtn');
+  if (!audioOn) {
+    if (!('MediaSource' in window)) { toast('此浏览器不支持音频流'); return; }
+    try {
+      aQueue = []; sbA = null;
+      msA = new MediaSource();
+      aEl = new Audio();
+      aEl.src = URL.createObjectURL(msA);
+      msA.addEventListener('sourceopen', () => {
+        try {
+          sbA = msA.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+          sbA.addEventListener('updateend', pumpA);
+        } catch { toast('此浏览器不支持 AAC 音频流'); }
+      });
+      aEl.play().catch(() => {});
+      send({ type: 'audio', on: true });
+      audioOn = true; btn.textContent = '🔊'; btn.classList.add('flash');
+    } catch { toast('音频启动失败'); }
+  } else {
+    send({ type: 'audio', on: false });
+    audioOn = false; btn.textContent = '🔇'; btn.classList.remove('flash');
+    if (aEl) { aEl.pause(); aEl = null; }
+    aQueue = [];
+  }
 };
 
 /* ---------- downloads panel ---------- */

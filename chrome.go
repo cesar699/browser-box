@@ -89,7 +89,7 @@ func runChromeOnce(cfg *config, a *app) error {
 		"--no-zygote", // renderers fork directly; zygote breaks in restricted containers/sandboxes
 		"--disable-gpu-sandbox",
 		"--hide-scrollbars",
-		"--mute-audio",
+		"--autoplay-policy=no-user-gesture-required", // audio must play without a local click (sound goes to the pulse sink)
 		fmt.Sprintf("--window-size=%d,%d", cfg.width, cfg.height),
 		"--force-device-scale-factor=1",
 		"about:blank",
@@ -100,6 +100,8 @@ func runChromeOnce(cfg *config, a *app) error {
 	}
 	log.Printf("starting chrome: %s (debug port %d, profile %s)", bin, port, cfg.profile)
 	cmd := exec.Command(bin, args...)
+	// Route Chrome's sound into the audio pipeline's pulse sink.
+	cmd.Env = append(os.Environ(), "PULSE_SINK=bb", "XDG_RUNTIME_DIR="+pulseDir())
 	cmd.Stdout = os.Stderr // chrome logs go to our stderr, prefixed by journald/docker
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

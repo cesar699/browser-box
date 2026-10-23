@@ -179,12 +179,15 @@ type controller struct {
 	order   []string
 	known   map[string]bool // targetIds we created/attached ourselves
 	active  string
-	width   int
-	height  int
-	quality int
-	dsf     float64
-	casting bool
-	viewers int
+	width      int
+	height     int
+	quality    int
+	dsf        float64
+	maxFPS     int
+	frameScale float64
+	lastAck    time.Time
+	casting    bool
+	viewers    int
 
 	pendingChooser *chooserReq
 	lastUpload     string
@@ -198,6 +201,7 @@ func newController(cfg *config, hub *hub, cdp *cdpConn) (*controller, error) {
 		cfg: cfg, hub: hub, cdp: cdp,
 		tabs: make(map[string]*tab), known: make(map[string]bool),
 		width: cfg.width, height: cfg.height, quality: 60, dsf: 1,
+		maxFPS: 24, frameScale: 1,
 		downloads: make(map[string]string),
 	}
 	cdp.onEvent = ctl.onEvent
@@ -369,7 +373,8 @@ func (ctl *controller) startScreencastLocked() error {
 	for i := 0; i < 10; i++ {
 		_, lastErr = ctl.tabCall(t, "Page.startScreencast", map[string]any{
 			"format": "jpeg", "quality": ctl.quality,
-			"maxWidth": int(float64(ctl.width) * ctl.dsf), "maxHeight": int(float64(ctl.height) * ctl.dsf),
+			"maxWidth":  int(float64(ctl.width) * ctl.dsf * ctl.frameScale),
+			"maxHeight": int(float64(ctl.height) * ctl.dsf * ctl.frameScale),
 			"everyNthFrame": 1,
 		})
 		if lastErr == nil {
@@ -503,7 +508,26 @@ func (ctl *controller) onEvent(env envelope) {
 		if err := json.Unmarshal(env.Params, &f); err != nil {
 			return
 		}
-		ctl.cdp.notify(owner.sessionID, "Page.screencastFrameAck", map[string]any{"sessionId": f.SessionID})
+		// Chrome sends the next frame only after this one is acked, so the
+		// ack delay IS the frame-rate limiter (the main anti-lag lever:
+		// fewer, smaller frames beat a flooded uplink).
+		now := time.Now()
+		wait := time.Duration(0)
+		if ctl.maxFPS > 0 {
+			wait = time.Second/time.Duration(ctl.maxFPS) - now.Sub(ctl.lastAck)
+			if wait < 0 {
+				wait = 0
+			}
+		}
+		ctl.lastAck = now.Add(wait)
+		sid, fsid := owner.sessionID, f.SessionID
+		if wait == 0 {
+			ctl.cdp.notify(sid, "Page.screencastFrameAck", map[string]any{"sessionId": fsid})
+		} else {
+			time.AfterFunc(wait, func() {
+				ctl.cdp.notify(sid, "Page.screencastFrameAck", map[string]any{"sessionId": fsid})
+			})
+		}
 		jpg, err := base64.StdEncoding.DecodeString(f.Data)
 		if err == nil && len(jpg) > 0 {
 			ctl.hub.publish(jpg)
@@ -685,6 +709,27 @@ func (ctl *controller) handleClientMsg(m clientMsg) {
 				if err := ctl.startScreencastLocked(); err == nil {
 					ctl.casting = true
 				}
+			}
+		}
+		return
+	case "perf":
+		// Combined performance preset: jpeg quality + fps cap + frame scale.
+		restart := false
+		if m.Quality >= 20 && m.Quality <= 95 && m.Quality != ctl.quality {
+			ctl.quality = m.Quality
+			restart = true
+		}
+		if m.Scale >= 0.4 && m.Scale <= 1 && m.Scale != ctl.frameScale {
+			ctl.frameScale = m.Scale
+			restart = true
+		}
+		if m.FPS >= 5 && m.FPS <= 60 {
+			ctl.maxFPS = m.FPS // pacing only, no restart needed
+		}
+		if restart && ctl.casting {
+			ctl.stopScreencastLocked()
+			if err := ctl.startScreencastLocked(); err == nil {
+				ctl.casting = true
 			}
 		}
 		return

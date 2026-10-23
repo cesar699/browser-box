@@ -195,16 +195,19 @@ type hub struct {
 	latest    []byte
 	status    string
 	onViewers func(n int)
+	audioInit []byte
 }
 
 type viewer struct {
-	ch chan []byte
+	ch      chan []byte
+	audioCh chan []byte
+	audioOn bool
 }
 
 func newHub() *hub { return &hub{clients: make(map[*viewer]struct{}), status: "starting"} }
 
 func (h *hub) add() *viewer {
-	v := &viewer{ch: make(chan []byte, 1)}
+	v := &viewer{ch: make(chan []byte, 1), audioCh: make(chan []byte, 8)}
 	h.mu.Lock()
 	h.clients[v] = struct{}{}
 	latest := h.latest
@@ -261,6 +264,51 @@ func (h *hub) fanout(frame []byte) {
 // binary frame too — the client distinguishes by first byte '{').
 func (h *hub) publishText(jsonMsg string) { h.fanout([]byte(jsonMsg)) }
 
+// ---------- audio fanout ----------
+
+func (h *hub) setAudioInit(b []byte) {
+	h.mu.Lock()
+	h.audioInit = b
+	h.mu.Unlock()
+}
+
+func (h *hub) publishAudio(chunk []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for v := range h.clients {
+		if !v.audioOn {
+			continue
+		}
+		select {
+		case v.audioCh <- chunk:
+		default: // drop oldest to keep latency bounded
+			select {
+			case <-v.audioCh:
+			default:
+			}
+			select {
+			case v.audioCh <- chunk:
+			default:
+			}
+		}
+	}
+}
+
+// setAudio toggles one viewer's audio; on enable, the cached fMP4 init
+// segment goes first so its player can start mid-stream.
+func (h *hub) setAudio(v *viewer, on bool) {
+	h.mu.Lock()
+	v.audioOn = on
+	init := h.audioInit
+	h.mu.Unlock()
+	if on && init != nil {
+		select {
+		case v.audioCh <- init:
+		default:
+		}
+	}
+}
+
 func (h *hub) viewerCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -316,6 +364,7 @@ func main() {
 	_ = os.MkdirAll(uploadsDir(), 0o755)
 
 	go superviseChrome(cfg, a)
+	go runAudioLoop(a.hub)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleIndex)
@@ -516,6 +565,9 @@ type clientMsg struct {
 	TabID   string  `json:"tabId,omitempty"`
 	Quality int     `json:"quality,omitempty"`
 	DSF     float64 `json:"dsf,omitempty"`
+	FPS     int     `json:"fps,omitempty"`
+	Scale   float64 `json:"scale,omitempty"`
+	On      bool    `json:"on,omitempty"`
 }
 
 func (a *app) handleWS(ws *websocket.Conn) {
@@ -532,12 +584,20 @@ func (a *app) handleWS(ws *websocket.Conn) {
 		c.sendTabStateSync()
 	}
 
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
-		for f := range v.ch {
-			if err := websocket.Message.Send(ws, f); err != nil {
-				return
+		for {
+			select {
+			case f := <-v.ch:
+				if err := websocket.Message.Send(ws, f); err != nil {
+					return
+				}
+			case chunk := <-v.audioCh:
+				msg := make([]byte, 0, len(chunk)+1)
+				msg = append(msg, 0xA1) // audio marker; frames start 0xFF, JSON '{'
+				msg = append(msg, chunk...)
+				if err := websocket.Message.Send(ws, msg); err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -549,6 +609,10 @@ func (a *app) handleWS(ws *websocket.Conn) {
 		}
 		var m clientMsg
 		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			continue
+		}
+		if m.Type == "audio" {
+			a.hub.setAudio(v, m.On)
 			continue
 		}
 		if c := a.controller(); c != nil {
