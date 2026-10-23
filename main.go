@@ -1,8 +1,7 @@
 // browser-box: self-hosted remote browser.
 // A single Go binary that drives a real Chrome (Chrome for Testing) over CDP,
 // streams its frames to your browser over one WebSocket, and sends your
-// mouse/keyboard back. One TCP port, password-only login, no Docker, no UDP,
-// no NAT config — the whole Neko-era pain list designed out.
+// mouse/keyboard back. One TCP port, password-only login, no Docker, no UDP.
 package main
 
 import (
@@ -12,11 +11,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,7 +43,7 @@ a{display:inline-block;margin:8px;padding:12px 22px;background:#1c2330;border:1p
 type config struct {
 	listen   string
 	password string
-	chrome   string // chrome binary path ("" = auto-detect)
+	chrome   string
 	profile  string
 	startURL string
 	width    int
@@ -62,7 +64,7 @@ func loadConfig() *config {
 	flag.StringVar(&c.password, "password", os.Getenv("BROWSERBOX_PASSWORD"), "login password (env BROWSERBOX_PASSWORD)")
 	flag.StringVar(&c.chrome, "chrome", os.Getenv("BROWSERBOX_CHROME"), "chrome binary path")
 	flag.StringVar(&c.profile, "profile", envOr("BROWSERBOX_PROFILE", filepath.Join(exeDir(), "profile")), "chrome profile dir")
-	flag.StringVar(&c.startURL, "url", "", "initial page (empty = built-in start page)")
+	flag.StringVar(&c.startURL, "url", "", "initial page (empty = start page / last visited)")
 	flag.IntVar(&c.width, "width", 1280, "initial viewport width")
 	flag.IntVar(&c.height, "height", 720, "initial viewport height")
 	flag.Parse()
@@ -81,6 +83,28 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func downloadsDir() string { return filepath.Join(exeDir(), "downloads") }
+func uploadsDir() string   { return filepath.Join(exeDir(), "uploads") }
+func statePath() string    { return filepath.Join(exeDir(), "browser-box-state.json") }
+
+type savedState struct {
+	LastURL string `json:"lastURL"`
+}
+
+func loadState() savedState {
+	var s savedState
+	b, err := os.ReadFile(statePath())
+	if err == nil {
+		_ = json.Unmarshal(b, &s)
+	}
+	return s
+}
+
+func saveState(s savedState) {
+	b, _ := json.Marshal(s)
+	_ = os.WriteFile(statePath(), b, 0o600)
 }
 
 // ---------- sessions ----------
@@ -118,15 +142,59 @@ func (s *sessions) drop(tok string) {
 	s.mu.Unlock()
 }
 
+// ---------- login lockout ----------
+
+type lockout struct {
+	mu       sync.Mutex
+	failures map[string][]time.Time
+	locked   map[string]time.Time
+}
+
+func newLockout() *lockout {
+	return &lockout{failures: make(map[string][]time.Time), locked: make(map[string]time.Time)}
+}
+
+func (l *lockout) isLocked(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	until, ok := l.locked[ip]
+	return ok && time.Now().Before(until)
+}
+
+func (l *lockout) fail(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	cut := now.Add(-10 * time.Minute)
+	var kept []time.Time
+	for _, t := range l.failures[ip] {
+		if t.After(cut) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	l.failures[ip] = kept
+	if len(kept) >= 8 {
+		l.locked[ip] = now.Add(5 * time.Minute)
+		delete(l.failures, ip)
+		log.Printf("login locked for %s (too many failures)", ip)
+	}
+}
+
+func (l *lockout) success(ip string) {
+	l.mu.Lock()
+	delete(l.failures, ip)
+	l.mu.Unlock()
+}
+
 // ---------- frame hub ----------
-// Broadcasts JPEG frames to all connected viewers. Each viewer keeps only the
-// newest frame: a slow client drops frames instead of building up lag.
 
 type hub struct {
-	mu      sync.Mutex
-	clients map[*viewer]struct{}
-	latest  []byte
-	status  string
+	mu        sync.Mutex
+	clients   map[*viewer]struct{}
+	latest    []byte
+	status    string
+	onViewers func(n int)
 }
 
 type viewer struct {
@@ -140,9 +208,14 @@ func (h *hub) add() *viewer {
 	h.mu.Lock()
 	h.clients[v] = struct{}{}
 	latest := h.latest
+	n := len(h.clients)
+	cb := h.onViewers
 	h.mu.Unlock()
 	if latest != nil {
 		v.ch <- latest
+	}
+	if cb != nil {
+		go cb(n)
 	}
 	return v
 }
@@ -150,16 +223,28 @@ func (h *hub) add() *viewer {
 func (h *hub) remove(v *viewer) {
 	h.mu.Lock()
 	delete(h.clients, v)
+	n := len(h.clients)
+	cb := h.onViewers
 	h.mu.Unlock()
+	if cb != nil {
+		go cb(n)
+	}
 }
 
 func (h *hub) publish(frame []byte) {
 	h.mu.Lock()
 	h.latest = frame
+	h.mu.Unlock()
+	h.fanout(frame)
+}
+
+func (h *hub) fanout(frame []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for v := range h.clients {
 		select {
 		case v.ch <- frame:
-		default: // viewer busy: replace its queued frame with the newest
+		default:
 			select {
 			case <-v.ch:
 			default:
@@ -170,13 +255,23 @@ func (h *hub) publish(frame []byte) {
 			}
 		}
 	}
-	h.mu.Unlock()
+}
+
+// publishText sends a JSON control message to every viewer (delivered as a
+// binary frame too — the client distinguishes by first byte '{').
+func (h *hub) publishText(jsonMsg string) { h.fanout([]byte(jsonMsg)) }
+
+func (h *hub) viewerCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.clients)
 }
 
 func (h *hub) setStatus(s string) {
 	h.mu.Lock()
 	h.status = s
 	h.mu.Unlock()
+	h.publishText(statusJSON(s))
 }
 
 func (h *hub) getStatus() string {
@@ -190,8 +285,9 @@ func (h *hub) getStatus() string {
 type app struct {
 	cfg  *config
 	sess *sessions
+	lock *lockout
 	hub  *hub
-	ctl  *controller // CDP controller; set once chrome is up
+	ctl  *controller
 	mu   sync.RWMutex
 }
 
@@ -215,9 +311,10 @@ func (a *app) authed(r *http.Request) bool {
 func main() {
 	log.SetFlags(log.Ltime)
 	cfg := loadConfig()
-	a := &app{cfg: cfg, sess: newSessions(), hub: newHub()}
+	a := &app{cfg: cfg, sess: newSessions(), lock: newLockout(), hub: newHub()}
+	_ = os.MkdirAll(downloadsDir(), 0o755)
+	_ = os.MkdirAll(uploadsDir(), 0o755)
 
-	// Chrome supervisor: keeps Chrome + the CDP session alive forever.
 	go superviseChrome(cfg, a)
 
 	mux := http.NewServeMux()
@@ -229,6 +326,9 @@ func main() {
 	mux.HandleFunc("/api/login", a.handleLogin)
 	mux.HandleFunc("/api/logout", a.handleLogout)
 	mux.HandleFunc("/api/me", a.handleMe)
+	mux.HandleFunc("/api/files", a.handleFiles)
+	mux.HandleFunc("/api/download", a.handleDownload)
+	mux.HandleFunc("/api/upload", a.handleUpload)
 	mux.Handle("/ws", websocket.Handler(a.handleWS))
 
 	ln, err := net.Listen("tcp", cfg.listen)
@@ -254,9 +354,22 @@ type loginReq struct {
 	Password string `json:"password"`
 }
 
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.NotFound(w, r)
+		return
+	}
+	ip := clientIP(r)
+	if a.lock.isLocked(ip) {
+		http.Error(w, "too many attempts, try again in a few minutes", http.StatusTooManyRequests)
 		return
 	}
 	var req loginReq
@@ -265,10 +378,12 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(req.Password), []byte(a.cfg.password)) != 1 {
-		time.Sleep(400 * time.Millisecond) // slow down guessing
+		a.lock.fail(ip)
+		time.Sleep(400 * time.Millisecond)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	a.lock.success(ip)
 	tok := a.sess.create()
 	http.SetCookie(w, &http.Cookie{
 		Name: "bb_session", Value: tok, Path: "/",
@@ -295,14 +410,95 @@ func (a *app) handleMe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ---------- file APIs ----------
+
+type fileInfo struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+func (a *app) handleFiles(w http.ResponseWriter, r *http.Request) {
+	if !a.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	ents, _ := os.ReadDir(downloadsDir())
+	var out []fileInfo
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			out = append(out, fileInfo{Name: e.Name(), Size: info.Size()})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (a *app) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if !a.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	name := filepath.Base(r.URL.Query().Get("name"))
+	if name == "." || name == "/" || strings.Contains(name, "..") {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, filepath.Join(downloadsDir(), name))
+}
+
+func (a *app) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	if !a.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		http.Error(w, "bad upload", http.StatusBadRequest)
+		return
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "no file", http.StatusBadRequest)
+		return
+	}
+	defer f.Close()
+	name := filepath.Base(hdr.Filename)
+	dst := filepath.Join(uploadsDir(), name)
+	out, err := os.Create(dst)
+	if err != nil {
+		http.Error(w, "save failed", http.StatusInternalServerError)
+		return
+	}
+	_, err = io.Copy(out, f)
+	_ = out.Close()
+	if err != nil {
+		http.Error(w, "save failed", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("uploaded %s (%d bytes)", name, hdr.Size)
+	if c := a.controller(); c != nil {
+		c.onUpload(dst)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
 // ---------- websocket: frames out, input in ----------
 
 type clientMsg struct {
 	Type string `json:"type"`
 	// mouse
-	X         float64 `json:"x,omitempty"`
-	Y         float64 `json:"y,omitempty"`
-	Button    string  `json:"button,omitempty"` // left|middle|right|none
+	X      float64 `json:"x,omitempty"`
+	Y      float64 `json:"y,omitempty"`
+	Button string  `json:"button,omitempty"`
+	// Buttons is the pressed-buttons bitmask.
 	Buttons   int     `json:"buttons,omitempty"`
 	DeltaX    float64 `json:"deltaX,omitempty"`
 	DeltaY    float64 `json:"deltaY,omitempty"`
@@ -310,14 +506,16 @@ type clientMsg struct {
 	// keyboard
 	Key       string `json:"key,omitempty"`
 	Code      string `json:"code,omitempty"`
-	VK        int     `json:"vk,omitempty"`
+	VK        int    `json:"vk,omitempty"`
 	Text      string `json:"text,omitempty"`
-	Modifiers int     `json:"modifiers,omitempty"`
-	Down      bool    `json:"down,omitempty"`
-	// nav / misc
-	URL    string `json:"url,omitempty"`
-	Width  int    `json:"width,omitempty"`
-	Height int    `json:"height,omitempty"`
+	Modifiers int    `json:"modifiers,omitempty"`
+	// misc
+	URL     string  `json:"url,omitempty"`
+	Width   int     `json:"width,omitempty"`
+	Height  int     `json:"height,omitempty"`
+	TabID   string  `json:"tabId,omitempty"`
+	Quality int     `json:"quality,omitempty"`
+	DSF     float64 `json:"dsf,omitempty"`
 }
 
 func (a *app) handleWS(ws *websocket.Conn) {
@@ -329,10 +527,11 @@ func (a *app) handleWS(ws *websocket.Conn) {
 	v := a.hub.add()
 	defer a.hub.remove(v)
 
-	// status greeting
 	_ = websocket.Message.Send(ws, statusJSON(a.hub.getStatus()))
+	if c := a.controller(); c != nil {
+		c.sendTabStateSync()
+	}
 
-	// writer: frames + periodic status
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -343,7 +542,6 @@ func (a *app) handleWS(ws *websocket.Conn) {
 		}
 	}()
 
-	// reader: client control messages
 	for {
 		var raw string
 		if err := websocket.Message.Receive(ws, &raw); err != nil {
