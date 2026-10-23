@@ -1,76 +1,47 @@
-# 云浏览器（Neko + Chromium）
+# browser-box
 
-把一个真正的 Chromium 浏览器跑在你的 VPS 上：你在手机/电脑浏览器里打开一个页面，
-看到的就是 VPS 上那个浏览器的实时画面（WebRTC 推流），点击、打字、滚动都传过去执行。
-**所有网页请求都从 VPS 出口发出**，本地只收画面——适合"目标网站本地连不上、但服务器能连"的场景。
-和反向代理的区别：JS、Cookie、CDN、登录都在服务器端真浏览器里原生跑，不存在改写不全的问题。
+跑在自己服务器上的远程浏览器：浏览器本体在服务器上运行，画面推到你的手机/电脑，你的点击和打字再送回去。所有网页流量从服务器出口走。
 
-## 快速开始
+**自研实现**（v2）：单个 Go 程序通过 CDP 协议直接驱动官方独立版 Chrome（Chrome for Testing），把画面以帧流经 WebSocket 推给前端。不用 Docker、不拉镜像、不用 WebRTC/UDP、不用填公网 IP——**只占一个 TCP 端口**。登录只有密码，没有用户名环节。浏览器崩了会自动拉起，资料（Cookie/登录态）存在 `profile/` 里，重启不丢。
 
-前置：VPS 装有或能装 Docker（脚本会自动装）、内存 ≥2G、能放行端口。
+> v1 是基于 Neko 的 Docker 部署包，已被本实现取代；deploy.sh 会自动停用旧的 Neko 容器。
 
-一行部署（脚本会自动把仓库克隆到 `/opt/browser-box` 再执行）：
+## 一键部署
+
+前置：一台能联网的 Linux 服务器（Debian/Ubuntu，x86_64），root 或 sudo。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cesar699/browser-box/main/deploy.sh | sudo bash
 ```
 
-或手动：把本仓库克隆到 VPS，进目录执行 `bash deploy.sh`。
+脚本做的事：克隆本仓库到 `/opt/browser-box` → 装 Go 工具链 → 下载 Chrome for Testing（版本锁定 156.0.8078.47）→ 编译 → 生成随机登录密码写入 `browser-box.env` → 注册 systemd 服务 `browser-box` 并启动 → 健康检查后打印访问地址和密码。
 
-脚本会：装 Docker（如缺）→ 生成 `.env`（随机强密码 + 自动探测公网 IP）→ 尝试放行本机 ufw → 拉镜像启动 → 健康检查 → 打印访问地址和密码。
+重复执行同一命令 = 更新（拉最新代码重编译重启，密码和浏览器资料保留）。
 
-打开 `http://服务器IP:8080`，填任意显示名 + 密码（管理员密码能拿控制权），就进浏览器了。
+云安全组只需放行 **TCP 8080**（可用 `PORT=xxxx` 环境变量改端口）。
 
-## 必须手动做的一件事：云安全组放行 UDP
+## 使用
 
-在云厂商控制台的安全组/防火墙里放行：
+打开 `http://<服务器IP>:8080`，输密码进入（**没有用户名**）。顶部地址栏输入网址回车打开；「粘贴」按钮可以把一段文字送进远程浏览器当前输入框（手机上打长串网址/密码时方便）。
 
-| 端口 | 用途 |
-|---|---|
-| TCP 8080（或你改的 WEB_PORT） | Web 界面（若走 HTTPS 反代可不对公网开放） |
-| **UDP 52000–52100** | WebRTC 画面推流，**漏了它就是能登录但黑屏** |
+- 改密码：编辑 `/opt/browser-box/browser-box.env`，然后 `systemctl restart browser-box`
+- 看日志：`journalctl -u browser-box -f`
+- 绑域名上 HTTPS：用 nginx/Caddy 反代到 `127.0.0.1:8080` 即可（需透传 WebSocket Upgrade），再把服务改成只听本机：`browser-boxd -listen 127.0.0.1:8080`（改 systemd 的 ExecStart）
 
-## 配 HTTPS（推荐）
-
-裸 HTTP 登录密码是明文的，长期用请套 HTTPS，二选一：
-
-- 已有 nginx：用目录里的 `nginx-site.conf`（改域名和证书路径后启用）
-- 用 Caddy 且 80/443 空闲：用 `Caddyfile.snippet`
-
-配好后把 `.env` 的 `WEB_BIND` 改为 `127.0.0.1`，重跑 `bash deploy.sh`（界面只经反代暴露）。
-
-## 常用调整（改 .env 后重跑 deploy.sh 生效）
-
-| 需求 | 改动 |
-|---|---|
-| 改密码 | `NEKO_USER_PASSWORD` / `NEKO_ADMIN_PASSWORD` |
-| 手机竖屏使用 | `NEKO_SCREEN=720x1280@30` |
-| 画面卡顿省带宽 | `NEKO_SCREEN=1024x576@25` |
-| 换界面端口 | `WEB_PORT` |
-
-浏览器资料（登录态、Cookie、书签）在 `./profile/` 里持久化，备份这个目录就是备份浏览器；
-删掉它等于恢复出厂。
-
-## 更新 / 停止 / 卸载
+## 本地运行（开发）
 
 ```bash
-bash deploy.sh          # 更新（拉最新镜像重启，数据保留）
-docker compose down     # 停止
-docker compose down && rm -rf profile .env   # 彻底卸载（含数据）
+go build -o browser-boxd .
+BROWSERBOX_PASSWORD=你的密码 ./browser-boxd -listen :8080
+# Chrome 放在 ./chrome-linux64/chrome，或用 BROWSERBOX_CHROME 指定路径
 ```
 
-## 故障排查
+## 已知边界
 
-| 现象 | 原因与解法 |
-|---|---|
-| 页面打不开 | `docker compose ps` 看容器状态；`docker compose logs -f neko` 看日志；确认 TCP 端口在安全组放行 |
-| 能登录但黑屏/转圈 | 十有八九是 UDP 52000–52100 没在**云安全组**放行；或 `.env` 的 `PUBLIC_IP` 不是这台 VPS 的公网 IP（换过 IP 要改） |
-| 画面糊/延迟高 | 降分辨率/帧率（见上表）；VPS 到你本地的线路质量决定下限 |
-| 某网站提示"检测到代理/VPN"或给 410 | 是 VPS 出口 IP 被该站风控，与本方案无关——换出口 IP 才能解 |
-| Chromium 标签页崩溃 | 内存不足：加内存，或确认 compose 里 `shm_size: 2gb` 没被改小 |
+- v2 暂无声音（CDP 帧流只含画面与输入）；视频播放流畅度取决于服务器上行与帧率，日常浏览足够。
+- 单页签：远程里点开的新窗口链接会被改成当前页跳转（远程屏幕没有第二个窗口可放）。
+- 安全定位：个人自用。密码登录 + HttpOnly 会话 Cookie，公网长期使用请套 HTTPS。
 
-## 安全提示
+## 本地验证记录（2026-10-23）
 
-- 这是单人/熟人自用工具：管理员密码不要外传，访客密码和管理员密码分开用。
-- 不要把无密码状态暴露在公网；deploy.sh 默认生成 20 位随机密码，别改弱。
-- 浏览器里登录过的账号都在 profile 里，把 VPS 和 profile 目录当敏感数据看管。
+开发环境实跑通过：密码登录（对 200 / 错 401）、画面帧流连续且逐帧变化、点击坐标像素级准确（发送 0.25,0.12 → 页面收到 320,86 @1280×720）、键盘输入回环（输入框打出 "hi" 并触发页面事件）、视口 resize 后帧尺寸随之变化（1280×720 → 900×600）。期间修掉一个致命 bug：CDP 事件回调里同步等 ack 响应会把读循环堵死（改为事件队列 + ack 免等待发送）。

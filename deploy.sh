@@ -1,104 +1,122 @@
 #!/usr/bin/env bash
-# 云浏览器（Neko v3 + Chromium）一键部署
-# 用法一（推荐）：curl -fsSL https://raw.githubusercontent.com/cesar699/browser-box/main/deploy.sh | sudo bash
-# 用法二：把整个仓库目录放到 VPS 上，进目录执行  bash deploy.sh
-# 重复执行 = 更新（拉新镜像并重启），.env 与 profile 数据保留。
+# browser-box v2 一键部署（自研版：单个 Go 程序 + Chrome for Testing，无 Docker）
+# 用法：curl -fsSL https://raw.githubusercontent.com/cesar699/browser-box/main/deploy.sh | sudo bash
+# 重复执行 = 更新（拉最新源码重新编译并重启），密码与浏览器资料保留。
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null || true
 
-# 经 curl 管道执行时本机还没有仓库文件：先克隆/更新到 /opt/browser-box 再正式执行
-if [ ! -f docker-compose.yml ]; then
-  command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq git; }
-  if [ -d /opt/browser-box/.git ]; then
-    git -C /opt/browser-box pull --ff-only
-  else
-    git clone https://github.com/cesar699/browser-box.git /opt/browser-box
-  fi
-  cd /opt/browser-box
-  exec bash deploy.sh "$@"
-fi
+REPO="https://github.com/cesar699/browser-box.git"
+INSTALL_DIR="/opt/browser-box"
+GO_VERSION="1.25.5"
+CHROME_VERSION="156.0.8078.47"
+PORT="${PORT:-8080}"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m错误：\033[0m %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || SUDO="sudo"; SUDO="${SUDO:-}"
 
-[ "$(id -u)" -eq 0 ] || SUDO="sudo" ; SUDO="${SUDO:-}"
-
-# ---------- 1. Docker ----------
-if ! command -v docker >/dev/null 2>&1; then
-  say "未检测到 Docker，正在安装…"
-  curl -fsSL https://get.docker.com | $SUDO sh
-  $SUDO systemctl enable --now docker
+# 经 curl 管道执行时本机还没有仓库：先克隆/更新到 /opt/browser-box 再正式执行
+if [ ! -f go.mod ]; then
+  command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq git; }
+  if [ -d "$INSTALL_DIR/.git" ]; then
+    git -C "$INSTALL_DIR" pull --ff-only
+  else
+    $SUDO git clone "$REPO" "$INSTALL_DIR"
+  fi
+  cd "$INSTALL_DIR"
+  exec $SUDO bash deploy.sh "$@"
 fi
-docker compose version >/dev/null 2>&1 || die "docker compose 插件不可用，请更新 Docker 后重试"
 
-# ---------- 2. .env ----------
-gen_pw() { openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-20; }
-detect_ip() {
-  for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
-    ip="$(curl -fsS -m 8 "$u" 2>/dev/null | tr -d ' \n' || true)"
-    case "$ip" in *.*.*.*) echo "$ip"; return 0;; esac
-  done
-  return 1
-}
+# ---------- 0. 停掉 v1 的 Neko 容器（占着同一个 8080 端口） ----------
+if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx cloud-browser; then
+  say "检测到 v1（Neko）容器 cloud-browser，停用并移除（v2 不再需要它）…"
+  docker rm -f cloud-browser >/dev/null 2>&1 || true
+fi
 
-if [ ! -f .env ]; then
-  say "生成 .env（随机密码 + 自动探测公网 IP）…"
-  PUBLIC_IP="$(detect_ip)" || die "公网 IP 自动探测失败，请手动复制 .env.example 为 .env 并填写 PUBLIC_IP"
-  cat > .env <<EOF
-WEB_BIND=0.0.0.0
-WEB_PORT=8080
-PUBLIC_IP=${PUBLIC_IP}
-NEKO_USER_PASSWORD=$(gen_pw)
-NEKO_ADMIN_PASSWORD=$(gen_pw)
-NEKO_SCREEN=1280x720@30
+# ---------- 1. Go 工具链 ----------
+if ! command -v go >/dev/null 2>&1 && [ ! -x /usr/local/go/bin/go ]; then
+  say "安装 Go ${GO_VERSION}…"
+  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+  $SUDO tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
+fi
+export PATH="/usr/local/go/bin:$PATH"
+command -v go >/dev/null 2>&1 || die "Go 安装失败"
+say "Go: $(go version)"
+
+# ---------- 2. Chrome for Testing（独立版，无 snap 无 Docker） ----------
+if [ ! -x chrome-linux64/chrome ]; then
+  say "下载 Chrome for Testing ${CHROME_VERSION}…"
+  curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-linux64.zip" -o /tmp/chrome.zip
+  command -v unzip >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq unzip; }
+  unzip -q -o /tmp/chrome.zip && rm -f /tmp/chrome.zip
+  chmod +x chrome-linux64/chrome chrome-linux64/chrome_crashpad_handler chrome-linux64/chrome_sandbox 2>/dev/null || true
+fi
+./chrome-linux64/chrome --version >/dev/null 2>&1 || die "Chrome 无法运行（缺系统库时执行：apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 libcairo2）"
+say "Chrome: $(./chrome-linux64/chrome --version)"
+
+# ---------- 3. 编译 ----------
+say "编译 browser-boxd…"
+go build -trimpath -o browser-boxd .
+
+# ---------- 4. 配置（密码只生成一次，存 browser-box.env） ----------
+if [ ! -f browser-box.env ]; then
+  PW="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-20)"
+  cat > browser-box.env <<EOF
+BROWSERBOX_PASSWORD=${PW}
 EOF
-  chmod 600 .env
+  chmod 600 browser-box.env
+  say "已生成登录密码（存于 browser-box.env）"
 else
-  say ".env 已存在，沿用现有配置（更新模式）"
+  say "沿用已有 browser-box.env（更新模式，密码不变）"
 fi
-# shellcheck disable=SC1091
-set -a; . ./.env; set +a
-[ -n "${PUBLIC_IP:-}" ] || die ".env 里 PUBLIC_IP 为空，WebRTC 需要它，请填入 VPS 公网 IP 后重跑"
-[ "${NEKO_ADMIN_PASSWORD}" != "change-me-admin" ] || die ".env 里还是示例密码，请改掉后重跑"
+set -a; . ./browser-box.env; set +a
 
-# ---------- 3. 防火墙（本机 ufw；云安全组需另行放行，见结尾提醒） ----------
-if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi "Status: active"; then
-  say "ufw 已启用，放行 ${WEB_PORT}/tcp 与 52000-52100/udp…"
-  $SUDO ufw allow "${WEB_PORT}/tcp" >/dev/null || true
-  $SUDO ufw allow 52000:52100/udp >/dev/null || true
-fi
+# ---------- 5. systemd 服务 ----------
+say "写入 systemd 服务…"
+$SUDO tee /etc/systemd/system/browser-box.service >/dev/null <<EOF
+[Unit]
+Description=browser-box remote browser
+After=network.target
 
-# ---------- 4. 启动 ----------
-mkdir -p profile
-# 容器里的 neko 用户是 uid 1000；profile 若归 root 所有，Chromium 写不了资料目录会崩溃循环
-# （本地实测：root 所有时 crashpad 反复 SIGTRAP，改归 1000 后正常）
-$SUDO chown -R 1000:1000 profile
-say "拉取镜像并启动…"
-docker compose pull
-docker compose up -d
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${INSTALL_DIR}/browser-box.env
+ExecStart=${INSTALL_DIR}/browser-boxd -listen :${PORT}
+Restart=always
+RestartSec=3
 
-# ---------- 5. 健康检查 ----------
-say "等待服务响应（最长 90 秒）…"
+[Install]
+WantedBy=multi-user.target
+EOF
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable browser-box >/dev/null 2>&1 || true
+$SUDO systemctl restart browser-box
+
+# ---------- 6. 健康检查 ----------
+say "等待服务响应（最长 60 秒）…"
 ok=0
-for _ in $(seq 1 45); do
-  if curl -fsS -m 3 "http://127.0.0.1:${WEB_PORT}/" >/dev/null 2>&1; then ok=1; break; fi
+for _ in $(seq 1 30); do
+  if curl -fsS -m 3 "http://127.0.0.1:${PORT}/api/me" >/dev/null 2>&1; then ok=1; break; fi
   sleep 2
 done
-[ "$ok" -eq 1 ] || { docker compose logs --tail 50 neko || true; die "服务未起来，上面是最近日志"; }
+if [ "$ok" -ne 1 ]; then
+  $SUDO journalctl -u browser-box -n 40 --no-pager || true
+  die "服务未起来，上面是最近日志"
+fi
 
+PUBLIC_IP="$(curl -fsS -m 8 https://api.ipify.org 2>/dev/null || curl -fsS -m 8 https://ifconfig.me/ip 2>/dev/null || echo '<服务器IP>')"
 cat <<EOF
 
 ============================================================
- 云浏览器已启动 ✔
+ browser-box 已启动 ✔（自研版，无 Docker）
 
- 访问地址（先用 HTTP 测试）：http://${PUBLIC_IP}:${WEB_PORT}
- 管理员密码：${NEKO_ADMIN_PASSWORD}
- 访客密码：  ${NEKO_USER_PASSWORD}
- （密码也在 .env 里，登录后进入的是跑在 VPS 上的 Chromium）
+ 访问地址：http://${PUBLIC_IP}:${PORT}
+ 登录密码：${BROWSERBOX_PASSWORD}
+ （只有密码、没有用户名；密码也在 ${INSTALL_DIR}/browser-box.env）
 
- ★ 最容易翻车的一步：去云厂商控制台的安全组里放行 UDP 52000-52100。
-   没放行时表现为：能打开登录页、能登录，但画面黑屏/一直转圈。
- ★ 长期使用请配 HTTPS：目录里给了 nginx-site.conf 和 Caddyfile.snippet，
-   把子域名解析到本机后套上，再把 .env 的 WEB_BIND 改为 127.0.0.1 重跑本脚本。
+ 只需放行一个 TCP 端口 ${PORT}，没有 UDP、没有 NAT 配置。
+ 换密码：改 browser-box.env 后执行 systemctl restart browser-box
+ 看日志：journalctl -u browser-box -f
 ============================================================
 EOF
