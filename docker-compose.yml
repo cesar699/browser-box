@@ -1,0 +1,29 @@
+# 云浏览器（Neko v3 + Chromium）
+# 浏览器跑在 VPS 上，画面经 WebRTC 推到你的设备；所有网页流量从 VPS 出口走。
+# 配置项见 .env（由 deploy.sh 自动生成，或复制 .env.example 手动填写）。
+services:
+  neko:
+    image: ghcr.io/m1k1o/neko/chromium:3
+    container_name: cloud-browser
+    restart: unless-stopped
+    shm_size: "2gb"          # Chromium 渲染需要足够的共享内存，太小会崩
+    cap_add:
+      - SYS_ADMIN            # Chromium 沙箱/桌面捕获需要
+    ports:
+      # Web 界面。走本机 nginx/Caddy 反代 HTTPS 时，把 WEB_BIND 改为 127.0.0.1
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8080}:8080"
+      # WebRTC 媒体流（UDP）。云厂商安全组里必须同样放行这一段，否则能登录但黑屏
+      - "52000-52100:52000-52100/udp"
+    volumes:
+      # 浏览器资料（Cookie / 登录态 / 书签）持久化，重启不丢
+      - ./profile:/home/neko/.config/chromium
+    environment:
+      NEKO_MEMBER_PROVIDER: "multiuser"
+      NEKO_MEMBER_MULTIUSER_USER_PASSWORD: "${NEKO_USER_PASSWORD}"
+      NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: "${NEKO_ADMIN_PASSWORD}"
+      # 画面尺寸：横屏 1280x720@30；手机竖屏可改 720x1280@30
+      NEKO_DESKTOP_SCREEN: "${NEKO_SCREEN:-1280x720@30}"
+      NEKO_WEBRTC_EPR: "52000-52100"
+      NEKO_WEBRTC_ICELITE: "true"
+      # VPS 公网 IP（deploy.sh 自动探测写入 .env）；WebRTC 选址用，填错会导致黑屏
+      NEKO_WEBRTC_NAT1TO1: "${PUBLIC_IP}"
