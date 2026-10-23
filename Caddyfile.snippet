@@ -1,9 +1,0 @@
-# 可选：若 VPS 上用 Caddy（且 80/443 空闲），把下面两行加进 Caddyfile 即可，
-# 证书自动签发，WebSocket 自动透传。子域名先解析到本机。
-# 配好后把 .env 里 WEB_BIND 改为 127.0.0.1 并重跑 deploy.sh。
-
-browser.example.com {
-    reverse_proxy 127.0.0.1:8080
-}
-
-# 注意：WebRTC 的 UDP 52000-52100 不走 Caddy，仍需在安全组/防火墙直接放行。
